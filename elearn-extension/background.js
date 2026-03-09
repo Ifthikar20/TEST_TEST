@@ -1,226 +1,146 @@
-// background.js — Auto-Loop Engine
-// Scrapes DOM → calls Claude API → gets JSON → shows answer on badge
+// background.js — Simple: grab page → one Claude call → show answers on badge
 
-// ── Load API key ──
+// Load API key
 let API_KEY = "";
 try {
   importScripts("config.js");
   API_KEY = (typeof CONFIG !== "undefined" && CONFIG.API_KEY) || "";
-  console.log("[News Alerts] API key loaded:", API_KEY ? "YES (" + API_KEY.substring(0, 12) + "...)" : "MISSING!");
-} catch (e) {
-  console.error("[News Alerts] Failed to load config.js:", e);
-}
+} catch (e) { }
 
-// ── Badge colors ──
-const BADGE_COLORS = {
-  high: [34, 197, 94, 255],   // green
-  medium: [251, 191, 36, 255],   // yellow
-  low: [239, 68, 68, 255],   // red
-  unknown: [100, 116, 139, 255],   // gray
+console.log("[NA] Key:", API_KEY ? "loaded" : "MISSING");
+
+const COLORS = {
+  high: [34, 197, 94, 255],
+  medium: [251, 191, 36, 255],
+  low: [239, 68, 68, 255],
+  wait: [100, 116, 139, 255],
 };
 
-// ── State ──
 let stopRequested = false;
 
-function setBadge(text, confidence) {
-  const key = (confidence || "unknown").toLowerCase();
-  const color = BADGE_COLORS[key] || BADGE_COLORS.unknown;
+function badge(text, color) {
   chrome.action.setBadgeText({ text: String(text) });
-  chrome.action.setBadgeBackgroundColor({ color });
+  chrome.action.setBadgeBackgroundColor({ color: COLORS[color] || COLORS.wait });
 }
 
-// ── Message listener ──
+// ── Listen for start/stop ──
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "START_LOOP") {
     stopRequested = false;
     chrome.storage.local.set({ isRunning: true });
-    // Use the key from popup if provided, otherwise from config
     const key = msg.apiKey || API_KEY;
-    console.log("[News Alerts] START_LOOP received. Key present:", !!key, "TabId:", msg.tabId);
-    runLoop(msg.tabId, key);
-    sendResponse({ success: true });
+    console.log("[NA] START. Key present:", !!key);
+    run(msg.tabId, key);
+    sendResponse({ ok: true });
   }
   if (msg.type === "STOP_LOOP") {
     stopRequested = true;
     chrome.storage.local.set({ isRunning: false });
-    sendResponse({ success: true });
-  }
-  if (msg.type === "CLEAR_BADGE") {
-    chrome.action.setBadgeText({ text: "" });
-    sendResponse({ success: true });
+    sendResponse({ ok: true });
   }
   return true;
 });
 
 // ══════════════════════════════════════════
-//  AUTO-LOOP
-//  DOM scrape → Claude API → JSON → badge
+//  MAIN FLOW
+//  1. Grab full page text
+//  2. Send ALL of it to Claude in ONE call
+//  3. Get back ALL answers as JSON array
+//  4. Show each answer on badge, timed
 // ══════════════════════════════════════════
-async function runLoop(tabId, apiKey) {
-  console.log("[News Alerts] === LOOP STARTING ===");
-  setBadge("L", "unknown");
+async function run(tabId, apiKey) {
+  badge("L", "wait");
 
   if (!apiKey) {
-    console.error("[News Alerts] NO API KEY! Cannot call Claude.");
-    setBadge("KEY", "low");
-    finish();
+    console.error("[NA] No API key!");
+    badge("KEY", "low");
+    done();
     return;
   }
 
   try {
-    // Step 1: Ensure content script is injected
-    console.log("[News Alerts] Step 1: Injecting content script...");
-    await ensureContentScript(tabId);
-    console.log("[News Alerts] Content script ready.");
+    // Step 1: Make sure content script is there
+    await inject(tabId);
 
-    // Step 2: Scrape ALL questions from the DOM
-    console.log("[News Alerts] Step 2: Scraping all questions...");
-    const scrapeData = await sendToTab(tabId, { type: "SCRAPE_ALL" });
+    // Step 2: Grab the ENTIRE page
+    badge("L", "wait");
+    console.log("[NA] Grabbing page content...");
+    const page = await tab(tabId, { type: "GRAB_PAGE" });
 
-    if (!scrapeData) {
-      console.error("[News Alerts] SCRAPE_ALL returned null — content script not responding.");
-      setBadge("ERR", "low");
-      finish();
+    if (!page || !page.text) {
+      console.error("[NA] Could not read page. Got:", page);
+      badge("ERR", "low");
+      done();
       return;
     }
 
-    const questions = scrapeData.questions || [];
-    const total = questions.length;
-    console.log(`[News Alerts] Found ${total} questions on platform: ${scrapeData.platform}`);
+    console.log("[NA] Page grabbed:", page.text.length, "chars. Title:", page.title);
 
-    if (total === 0) {
-      console.log("[News Alerts] No questions found. Trying single-page fallback...");
-      setBadge("L", "unknown");
-      await processSingleQuestion(tabId, apiKey, scrapeData.pageText, 1);
-      finish();
-      return;
-    }
+    // Step 3: Send it ALL to Claude — one big call
+    badge("AI", "wait");
+    console.log("[NA] Calling Claude with full page text...");
+    const startTime = Date.now();
 
-    // Step 3: Process each question — call Claude API for each one
-    for (let i = 0; i < total; i++) {
+    const answers = await callClaude(page.text, apiKey);
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+    console.log(`[NA] Claude responded in ${elapsed}s with ${answers.length} answers:`);
+    answers.forEach(a => console.log(`  Q${a.q}: ${a.answer} (${a.confidence})`));
+
+    // Step 4: Show each answer on the badge, one at a time
+    for (let i = 0; i < answers.length; i++) {
       if (stopRequested) break;
 
-      const qNum = i + 1;
-      const q = questions[i];
+      const a = answers[i];
+      const conf = (a.confidence || "medium").toLowerCase();
+      const label = `${a.q}:${a.answer}`;
 
-      // Show loading for this question
-      setBadge(`${qNum}L`, "unknown");
-      console.log(`[News Alerts] ── Q${qNum}/${total} ──`);
-      console.log(`[News Alerts]   Question: "${q.question?.substring(0, 80)}"`);
-      console.log(`[News Alerts]   Choices: ${q.choices.length} options`);
-      q.choices.forEach((c, j) => console.log(`[News Alerts]     ${String.fromCharCode(65 + j)}. ${c.text?.substring(0, 60)}`));
+      badge(label, conf);
+      console.log(`[NA] Badge → ${label}`);
 
-      try {
-        // Step 3a: Call Claude API
-        console.log(`[News Alerts]   Calling Claude API...`);
-        const startTime = Date.now();
-
-        const result = await askClaude({
-          question: q.question,
-          choices: q.choices,
-          apiKey,
-          questionNum: qNum,
-        });
-
-        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-        console.log(`[News Alerts]   ✓ Claude responded in ${elapsed}s`);
-        console.log(`[News Alerts]   Answer: ${result.answerLetter} (${result.confidence})`);
-        console.log(`[News Alerts]   Reasoning: ${result.reasoning}`);
-
-        // Step 3b: Show answer on badge
-        const label = `${qNum}:${result.answerLetter || "?"}`;
-        setBadge(label, result.confidence);
-
-        // Step 3c: Highlight answer on page
-        if (result.answerIndex >= 0) {
-          await sendToTab(tabId, {
-            type: "HIGHLIGHT",
-            questionIndex: i,
-            choiceIndex: result.answerIndex,
-          });
-        }
-
-        // Step 3d: Keep answer visible for 4 seconds
-        console.log(`[News Alerts]   Badge showing "${label}" for 4 seconds...`);
-        await delay(4000);
-
-      } catch (qErr) {
-        console.error(`[News Alerts]   ✕ Q${qNum} FAILED:`, qErr.message);
-        setBadge(`${qNum}?`, "low");
-        await delay(2000);
-      }
-
-      // Single-question-per-page: advance
-      if (total === 1) {
-        const nextResult = await sendToTab(tabId, { type: "CLICK_NEXT" });
-        if (nextResult?.success && !stopRequested) {
-          await delay(1000);
-          await runLoop(tabId, apiKey);
-          return;
-        }
-      }
+      // Show each answer for 3 seconds
+      await delay(3000);
     }
 
-    console.log("[News Alerts] === LOOP COMPLETE ===");
-    // Last answer stays on the badge
+    // Keep last answer showing
+    console.log("[NA] Done! Last answer stays on badge.");
 
   } catch (err) {
-    console.error("[News Alerts] FATAL LOOP ERROR:", err);
-    setBadge("ERR", "low");
+    console.error("[NA] Error:", err);
+    badge("ERR", "low");
   }
 
-  finish();
+  done();
 }
 
-async function processSingleQuestion(tabId, apiKey, pageText, qNum) {
-  try {
-    const scrape = await sendToTab(tabId, { type: "SCRAPE", questionIndex: 0 });
-    if (!scrape) { setBadge("ERR", "low"); return; }
-
-    console.log(`[News Alerts] Single Q: "${scrape.question?.substring(0, 60)}"`);
-    const result = await askClaude({
-      question: scrape.question,
-      choices: scrape.choices,
-      pageText: pageText || scrape.pageText,
-      apiKey,
-      questionNum: qNum,
-    });
-
-    setBadge(`${qNum}:${result.answerLetter || "?"}`, result.confidence);
-    console.log(`[News Alerts] Answer: ${result.answerLetter}`);
-  } catch (err) {
-    console.error("[News Alerts] Single Q error:", err);
-    setBadge(`${qNum}?`, "low");
-  }
-}
-
-function finish() {
+function done() {
   chrome.storage.local.set({ isRunning: false });
   chrome.runtime.sendMessage({ type: "LOOP_DONE" }).catch(() => { });
 }
 
 // ══════════════════════════════════════════
-//  CLAUDE API CALL
-//  Sends question + choices → gets JSON back
+//  CLAUDE API — one call, all answers
 // ══════════════════════════════════════════
-async function askClaude({ question, choices, pageText, apiKey, questionNum }) {
-  const choiceList = choices.length
-    ? choices.map((c, i) => `${String.fromCharCode(65 + i)}. ${c.text}`).join("\n")
-    : "No choices detected.";
+async function callClaude(pageText, apiKey) {
+  const prompt = `You are looking at a quiz/test page. Find ALL the questions and their answer choices in the text below, then determine the CORRECT answer for each one.
 
-  const prompt = `You are answering a quiz question. Pick the BEST answer.
+PAGE CONTENT:
+${pageText.substring(0, 30000)}
 
-QUESTION #${questionNum}:
-${question || "(see page context)"}
+Return a JSON ARRAY with one entry per question. No markdown, no backticks, ONLY the JSON array:
+[
+  {"q": 1, "answer": "C", "confidence": "High", "reasoning": "brief reason"},
+  {"q": 2, "answer": "A", "confidence": "High", "reasoning": "brief reason"},
+  ...
+]
 
-CHOICES:
-${choiceList}
-${pageText ? `\nPAGE CONTEXT:\n${pageText.substring(0, 8000)}` : ""}
+Rules:
+- "q" is the question number (1, 2, 3...)
+- "answer" is the letter (A, B, C, D, etc.)
+- "confidence" is High, Medium, or Low
+- Include ALL questions you can find
+- Be accurate — think carefully about each answer`;
 
-Reply with ONLY this JSON (no markdown, no backticks):
-{"answerIndex": <0-based>, "answerLetter": "<A/B/C/D>", "confidence": "<High|Medium|Low>", "reasoning": "<why>", "questionSummary": "<summary>"}`;
-
-  // 120 second timeout
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 120000);
 
@@ -234,7 +154,7 @@ Reply with ONLY this JSON (no markdown, no backticks):
     },
     body: JSON.stringify({
       model: "claude-sonnet-4-20250514",
-      max_tokens: 512,
+      max_tokens: 4096,
       messages: [{ role: "user", content: prompt }],
     }),
     signal: controller.signal,
@@ -248,10 +168,15 @@ Reply with ONLY this JSON (no markdown, no backticks):
   }
 
   const data = await resp.json();
-  const raw = data.content?.[0]?.text || "{}";
-  console.log(`[News Alerts] Raw API response: ${raw.substring(0, 200)}`);
+  const raw = data.content?.[0]?.text || "[]";
+  console.log("[NA] Raw response:", raw.substring(0, 300));
+
+  // Clean and parse
   const clean = raw.replace(/```json|```/gi, "").trim();
-  return JSON.parse(clean);
+  const parsed = JSON.parse(clean);
+
+  // Ensure it's an array
+  return Array.isArray(parsed) ? parsed : [parsed];
 }
 
 // ══════════════════════════════════════════
@@ -261,7 +186,7 @@ function delay(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-function sendToTab(tabId, msg) {
+function tab(tabId, msg) {
   return new Promise(resolve => {
     chrome.tabs.sendMessage(tabId, msg, resp => {
       resolve(chrome.runtime.lastError ? null : resp);
@@ -269,8 +194,8 @@ function sendToTab(tabId, msg) {
   });
 }
 
-async function ensureContentScript(tabId) {
-  const alive = await sendToTab(tabId, { type: "PING" });
+async function inject(tabId) {
+  const alive = await tab(tabId, { type: "PING" });
   if (alive?.alive) return;
   await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
   await delay(500);
