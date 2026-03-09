@@ -65,7 +65,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 //  AUTO-LOOP — processes all questions
 // ══════════════════════════════════════════
 async function runLoop(tabId, apiKey) {
-  setBadge("...", "unknown");
+  setBadge("L", "unknown");
 
   try {
     // Ensure content script is loaded
@@ -74,16 +74,19 @@ async function runLoop(tabId, apiKey) {
     // Scrape all questions from the page
     const scrapeData = await sendToTab(tabId, { type: "SCRAPE_ALL" });
     if (!scrapeData || !scrapeData.questions) {
-      setBadge("✕", "low");
+      setBadge("ERR", "low");
+      console.error("SCRAPE_ALL returned:", scrapeData);
       finish();
       return;
     }
 
     const questions = scrapeData.questions;
     const total = questions.length;
+    console.log(`[News Alerts] Found ${total} questions on ${scrapeData.platform}`);
 
     if (total === 0) {
       // No structured questions found — try single-page mode
+      setBadge("L", "unknown");
       await processSingleQuestion(tabId, apiKey, scrapeData.pageText, 1);
       finish();
       return;
@@ -96,38 +99,48 @@ async function runLoop(tabId, apiKey) {
       const qNum = i + 1;
       const q = questions[i];
 
-      setBadge(`${qNum}…`, "unknown");
+      // Show loading indicator with question number
+      setBadge(`${qNum}L`, "unknown");
+      console.log(`[News Alerts] Q${qNum}: "${q.question?.substring(0, 60)}..." (${q.choices.length} choices)`);
 
-      // Build just this question's context for Claude
-      const result = await askClaude({
-        question: q.question,
-        choices: q.choices,
-        pageText: scrapeData.pageText,
-        apiKey,
-        questionNum: qNum,
-      });
-
-      const answerLabel = `${qNum}:${result.answerLetter || "?"}`;
-      setBadge(answerLabel, result.confidence);
-
-      // Click the answer on the page
-      if (result.answerIndex >= 0) {
-        await sendToTab(tabId, {
-          type: "CLICK_CHOICE",
-          questionIndex: i,
-          choiceIndex: result.answerIndex,
+      try {
+        // Build just this question's context for Claude
+        const result = await askClaude({
+          question: q.question,
+          choices: q.choices,
+          pageText: "", // Don't send full page — we have the question already
+          apiKey,
+          questionNum: qNum,
         });
-      }
 
-      // Small delay between questions
-      await delay(1500);
+        // Show the answer — this is what the user sees
+        const answerLabel = `${qNum}:${result.answerLetter || "?"}`;
+        setBadge(answerLabel, result.confidence);
+        console.log(`[News Alerts] Q${qNum} → ${result.answerLetter} (${result.confidence}) — ${result.reasoning}`);
+
+        // Click/highlight the answer on the page
+        if (result.answerIndex >= 0) {
+          await sendToTab(tabId, {
+            type: "CLICK_CHOICE",
+            questionIndex: i,
+            choiceIndex: result.answerIndex,
+          });
+        }
+
+        // Keep this answer visible for 4 seconds so user can read it
+        await delay(4000);
+
+      } catch (qErr) {
+        console.error(`[News Alerts] Q${qNum} error:`, qErr);
+        setBadge(`${qNum}:?`, "low");
+        await delay(2000);
+      }
 
       // If single-question-per-page, click next
       if (total === 1) {
         const nextResult = await sendToTab(tabId, { type: "CLICK_NEXT" });
         if (nextResult?.success) {
           await delay(1000);
-          // Re-scan for next page
           if (!stopRequested) {
             await runLoop(tabId, apiKey);
             return;
@@ -136,14 +149,12 @@ async function runLoop(tabId, apiKey) {
       }
     }
 
-    // Show final answer on badge
-    if (!stopRequested) {
-      setBadge("✓", "high");
-    }
+    // Keep the LAST answer showing — don't replace it with a checkmark
+    // The last setBadge call inside the loop already shows the last answer
 
   } catch (err) {
-    console.error("Loop error:", err);
-    setBadge("✕", "low");
+    console.error("[News Alerts] Loop error:", err);
+    setBadge("ERR", "low");
   }
 
   finish();
