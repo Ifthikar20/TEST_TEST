@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "eLearning Assistant",
+  "name": "News Alerts",
   "version": "1.0.0",
-  "description": "Scans eLearning quizzes and surfaces answers using AI",
+  "description": "Stay updated with the latest sports news and alerts",
   "permissions": [
     "activeTab",
     "scripting",

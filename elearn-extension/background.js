@@ -1,84 +1,223 @@
-// background.js — Service Worker
-// Handles Claude API calls + icon badge updates
+// background.js — Auto-Loop Engine
+// Processes each question individually, shows answers on icon badge
 
+// Load API key from config.js
+try { importScripts("config.js"); } catch (e) { }
+const DEFAULT_KEY = (typeof CONFIG !== "undefined" && CONFIG.API_KEY) || "";
+
+// ── Badge colors ──
 const BADGE_COLORS = {
-  high: [34, 197, 94, 255],
-  medium: [251, 191, 36, 255],
-  low: [239, 68, 68, 255],
-  unknown: [100, 116, 139, 255],
+  high: [34, 197, 94, 255],   // green
+  medium: [251, 191, 36, 255],   // yellow
+  low: [239, 68, 68, 255],   // red
+  unknown: [100, 116, 139, 255],   // gray
 };
 
-function setBadge(questionNum, answerLetter, confidence) {
+// ── State ──
+let stopRequested = false;
+
+function setBadge(text, confidence) {
   const key = (confidence || "unknown").toLowerCase();
   const color = BADGE_COLORS[key] || BADGE_COLORS.unknown;
-  const text = `${questionNum}:${answerLetter || "?"}`;
   chrome.action.setBadgeText({ text });
   chrome.action.setBadgeBackgroundColor({ color });
-  chrome.storage.local.set({ badgeText: text, badgeColor: color, badgeConfidence: key });
 }
 
 function clearBadge() {
   chrome.action.setBadgeText({ text: "" });
-  chrome.storage.local.remove(["badgeText", "badgeColor", "badgeConfidence"]);
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+// ── Message listener ──
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === "START_LOOP") {
+    stopRequested = false;
+    chrome.storage.local.set({ isRunning: true });
+    runLoop(msg.tabId, msg.apiKey || DEFAULT_KEY);
+    sendResponse({ success: true });
+  }
+  if (msg.type === "STOP_LOOP") {
+    stopRequested = true;
+    chrome.storage.local.set({ isRunning: false });
+    sendResponse({ success: true });
+  }
   if (msg.type === "ASK_CLAUDE") {
     const { questionNum } = msg.payload;
     askClaude(msg.payload)
       .then((result) => {
-        setBadge(questionNum, result.answerLetter, result.confidence);
+        const label = `${questionNum}:${result.answerLetter || "?"}`;
+        setBadge(label, result.confidence);
         sendResponse({ success: true, result });
       })
       .catch((err) => {
-        setBadge(questionNum, "?", "low");
+        setBadge(`${questionNum}:?`, "low");
         sendResponse({ success: false, error: err.message });
       });
-    return true;
-  }
-  if (msg.type === "SET_BADGE") {
-    setBadge(msg.questionNum, msg.answerLetter, msg.confidence);
-    sendResponse({ success: true });
     return true;
   }
   if (msg.type === "CLEAR_BADGE") {
     clearBadge();
     sendResponse({ success: true });
-    return true;
   }
+  return true;
 });
 
-// Load API key from config.js (never committed to git)
-try { importScripts("config.js"); } catch (e) { }
-const HARDCODED_KEY = (typeof CONFIG !== "undefined" && CONFIG.API_KEY) || "";
+// ══════════════════════════════════════════
+//  AUTO-LOOP — processes all questions
+// ══════════════════════════════════════════
+async function runLoop(tabId, apiKey) {
+  setBadge("...", "unknown");
 
-async function askClaude({ question, choices, pageText, apiKey }) {
-  apiKey = apiKey || HARDCODED_KEY;
+  try {
+    // Ensure content script is loaded
+    await ensureContentScript(tabId);
+
+    // Scrape all questions from the page
+    const scrapeData = await sendToTab(tabId, { type: "SCRAPE_ALL" });
+    if (!scrapeData || !scrapeData.questions) {
+      setBadge("✕", "low");
+      finish();
+      return;
+    }
+
+    const questions = scrapeData.questions;
+    const total = questions.length;
+
+    if (total === 0) {
+      // No structured questions found — try single-page mode
+      await processSingleQuestion(tabId, apiKey, scrapeData.pageText, 1);
+      finish();
+      return;
+    }
+
+    // Process each question individually
+    for (let i = 0; i < total; i++) {
+      if (stopRequested) break;
+
+      const qNum = i + 1;
+      const q = questions[i];
+
+      setBadge(`${qNum}…`, "unknown");
+
+      // Build just this question's context for Claude
+      const result = await askClaude({
+        question: q.question,
+        choices: q.choices,
+        pageText: scrapeData.pageText,
+        apiKey,
+        questionNum: qNum,
+      });
+
+      const answerLabel = `${qNum}:${result.answerLetter || "?"}`;
+      setBadge(answerLabel, result.confidence);
+
+      // Click the answer on the page
+      if (result.answerIndex >= 0) {
+        await sendToTab(tabId, {
+          type: "CLICK_CHOICE",
+          questionIndex: i,
+          choiceIndex: result.answerIndex,
+        });
+      }
+
+      // Small delay between questions
+      await delay(1500);
+
+      // If single-question-per-page, click next
+      if (total === 1) {
+        const nextResult = await sendToTab(tabId, { type: "CLICK_NEXT" });
+        if (nextResult?.success) {
+          await delay(1000);
+          // Re-scan for next page
+          if (!stopRequested) {
+            await runLoop(tabId, apiKey);
+            return;
+          }
+        }
+      }
+    }
+
+    // Show final answer on badge
+    if (!stopRequested) {
+      setBadge("✓", "high");
+    }
+
+  } catch (err) {
+    console.error("Loop error:", err);
+    setBadge("✕", "low");
+  }
+
+  finish();
+}
+
+async function processSingleQuestion(tabId, apiKey, pageText, qNum) {
+  try {
+    const scrape = await sendToTab(tabId, { type: "SCRAPE", questionIndex: 0 });
+    if (!scrape) {
+      setBadge("✕", "low");
+      return;
+    }
+
+    const result = await askClaude({
+      question: scrape.question,
+      choices: scrape.choices,
+      pageText: pageText || scrape.pageText,
+      apiKey,
+      questionNum: qNum,
+    });
+
+    const answerLabel = `${qNum}:${result.answerLetter || "?"}`;
+    setBadge(answerLabel, result.confidence);
+
+    if (result.answerIndex >= 0) {
+      await sendToTab(tabId, {
+        type: "CLICK_CHOICE",
+        questionIndex: 0,
+        choiceIndex: result.answerIndex,
+      });
+    }
+  } catch (err) {
+    setBadge(`${qNum}:?`, "low");
+  }
+}
+
+function finish() {
+  chrome.storage.local.set({ isRunning: false });
+  // Notify popup (if still open)
+  chrome.runtime.sendMessage({ type: "LOOP_DONE" }).catch(() => { });
+}
+
+// ══════════════════════════════════════════
+//  CLAUDE API
+// ══════════════════════════════════════════
+async function askClaude({ question, choices, pageText, apiKey, questionNum }) {
+  apiKey = apiKey || DEFAULT_KEY;
+
   const choiceList = choices.length
     ? choices.map((c, i) => `${String.fromCharCode(65 + i)}. ${c.text}`).join("\n")
-    : "No multiple choice options detected.";
+    : "No multiple choice options detected — look for answer choices in the page context.";
 
-  const prompt = `You are analyzing an eLearning quiz question. Based ONLY on the content provided, identify the most likely correct answer.
+  const prompt = `You are analyzing ONE specific quiz question. Identify the correct answer.
 
-QUESTION:
-${question || "(Question text not detected — see page context below)"}
+IMPORTANT: Focus ONLY on this specific question. Do NOT confuse it with other questions on the page.
+
+QUESTION #${questionNum}:
+${question || "(Question text not detected — extract the question from page context below)"}
 
 ANSWER CHOICES:
 ${choiceList}
 
-PAGE CONTEXT (full page text):
-${pageText || "N/A"}
+PAGE CONTEXT (for reference):
+${(pageText || "").substring(0, 10000)}
 
-Respond with a JSON object ONLY (no markdown, no preamble):
+Respond with a JSON object ONLY (no markdown, no code fences, no preamble):
 {
   "answerIndex": <0-based index of best answer, or -1 if unknown>,
-  "answerLetter": "<A/B/C/D etc., or 'Unknown'>",
+  "answerLetter": "<A/B/C/D etc.>",
   "confidence": "<High|Medium|Low>",
   "reasoning": "<1-2 sentence explanation>",
-  "questionSummary": "<10-word summary of the question>"
+  "questionSummary": "<10-word summary>"
 }`;
 
-  // 120-second timeout so we never silently die
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 120000);
 
@@ -103,7 +242,7 @@ Respond with a JSON object ONLY (no markdown, no preamble):
 
     if (!resp.ok) {
       const errBody = await resp.text();
-      throw new Error(`Claude API ${resp.status}: ${errBody}`);
+      throw new Error(`API ${resp.status}: ${errBody}`);
     }
 
     const data = await resp.json();
@@ -112,9 +251,30 @@ Respond with a JSON object ONLY (no markdown, no preamble):
     return JSON.parse(clean);
   } catch (err) {
     clearTimeout(timeout);
-    if (err.name === "AbortError") {
-      throw new Error("Request timed out (120s)");
-    }
+    if (err.name === "AbortError") throw new Error("Timeout (120s)");
     throw err;
   }
+}
+
+// ══════════════════════════════════════════
+//  HELPERS
+// ══════════════════════════════════════════
+
+function delay(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+function sendToTab(tabId, msg) {
+  return new Promise(resolve => {
+    chrome.tabs.sendMessage(tabId, msg, resp => {
+      resolve(chrome.runtime.lastError ? null : resp);
+    });
+  });
+}
+
+async function ensureContentScript(tabId) {
+  const alive = await sendToTab(tabId, { type: "PING" });
+  if (alive?.alive) return;
+  await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+  await delay(500);
 }
