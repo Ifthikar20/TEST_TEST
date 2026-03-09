@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <title>eLearning AI</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      width: 220px;
+      background: #000;
+      color: #fff;
+      font-family: 'JetBrains Mono', monospace;
+      overflow: hidden;
+      padding: 0;
+    }
+
+    .container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 16px 16px 14px;
+    }
+
+    /* ── Answer Badge ── */
+    .answer-badge {
+      width: 72px;
+      height: 72px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      margin-bottom: 10px;
+      position: relative;
+      transition: all 0.4s ease;
+    }
+
+    .answer-badge.idle {
+      background: rgba(255, 255, 255, 0.04);
+      border: 2px solid rgba(255, 255, 255, 0.08);
+      color: rgba(255, 255, 255, 0.2);
+    }
+
+    .answer-badge.scanning {
+      background: rgba(0, 229, 255, 0.06);
+      border: 2px solid rgba(0, 229, 255, 0.2);
+      color: rgba(0, 229, 255, 0.6);
+      animation: scan-pulse 1.2s ease infinite;
+    }
+
+    .answer-badge.high {
+      background: rgba(34, 197, 94, 0.1);
+      border: 2px solid rgba(34, 197, 94, 0.4);
+      color: #22c55e;
+      box-shadow: 0 0 20px rgba(34, 197, 94, 0.15);
+    }
+
+    .answer-badge.medium {
+      background: rgba(251, 191, 36, 0.1);
+      border: 2px solid rgba(251, 191, 36, 0.4);
+      color: #fbbf24;
+      box-shadow: 0 0 20px rgba(251, 191, 36, 0.15);
+    }
+
+    .answer-badge.low {
+      background: rgba(239, 68, 68, 0.1);
+      border: 2px solid rgba(239, 68, 68, 0.4);
+      color: #ef4444;
+      box-shadow: 0 0 20px rgba(239, 68, 68, 0.15);
+    }
+
+    .answer-badge.error {
+      background: rgba(239, 68, 68, 0.06);
+      border: 2px solid rgba(239, 68, 68, 0.2);
+      color: rgba(239, 68, 68, 0.6);
+    }
+
+    @keyframes scan-pulse {
+
+      0%,
+      100% {
+        border-color: rgba(0, 229, 255, 0.15);
+        transform: scale(1);
+      }
+
+      50% {
+        border-color: rgba(0, 229, 255, 0.35);
+        transform: scale(1.03);
+      }
+    }
+
+    /* ── Spinner inside badge ── */
+    .spinner {
+      width: 24px;
+      height: 24px;
+      border: 3px solid rgba(0, 229, 255, 0.15);
+      border-top-color: rgba(0, 229, 255, 0.7);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    /* ── Status text ── */
+    .status {
+      font-size: 10px;
+      color: rgba(255, 255, 255, 0.25);
+      text-align: center;
+      line-height: 1.4;
+      max-width: 190px;
+    }
+
+    .status.scanning {
+      color: rgba(0, 229, 255, 0.5);
+    }
+
+    .status.success {
+      color: rgba(255, 255, 255, 0.4);
+    }
+
+    .status.error {
+      color: rgba(239, 68, 68, 0.5);
+    }
+
+    /* ── Question counter ── */
+    .q-counter {
+      font-size: 9px;
+      color: rgba(255, 255, 255, 0.15);
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      margin-bottom: 10px;
+    }
+
+    /* ── Answer log (tiny) ── */
+    .log-wrap {
+      width: 100%;
+      border-top: 1px solid rgba(255, 255, 255, 0.04);
+      margin-top: 10px;
+      padding-top: 8px;
+      max-height: 100px;
+      overflow-y: auto;
+      scrollbar-width: none;
+    }
+
+    .log-wrap::-webkit-scrollbar {
+      display: none;
+    }
+
+    .log-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 0;
+      animation: fadeIn 0.2s ease;
+    }
+
+    @keyframes fadeIn {
+      from {
+        opacity: 0;
+      }
+
+      to {
+        opacity: 1;
+      }
+    }
+
+    .log-pill {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 1px 6px;
+      border-radius: 3px;
+      min-width: 34px;
+      text-align: center;
+    }
+
+    .log-pill.high {
+      background: rgba(34, 197, 94, 0.12);
+      color: #22c55e;
+    }
+
+    .log-pill.medium {
+      background: rgba(251, 191, 36, 0.12);
+      color: #fbbf24;
+    }
+
+    .log-pill.low {
+      background: rgba(239, 68, 68, 0.12);
+      color: #ef4444;
+    }
+
+    .log-hint {
+      font-size: 9px;
+      color: rgba(255, 255, 255, 0.15);
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Hidden elements for JS compat */
+    .hidden {
+      display: none !important;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <div class="q-counter" id="q-counter">–</div>
+    <div class="answer-badge idle" id="answer-badge">–</div>
+    <div class="status" id="status">Click to scan</div>
+    <div class="log-wrap" id="answer-log"></div>
+  </div>
+
+  <!-- Hidden elements for popup.js compatibility -->
+  <input type="password" id="api-key" class="hidden" />
+  <button id="btn-save-key" class="hidden"></button>
+  <button id="btn-auto" class="hidden"></button>
+  <button id="btn-scan" class="hidden"></button>
+  <button id="btn-next" class="hidden"></button>
+  <div id="q-text" class="hidden"></div>
+  <div id="badge-preview" class="hidden"></div>
+  <span id="p-cur" class="hidden">0</span>
+  <span id="p-tot" class="hidden">?</span>
+  <div id="progress-fill" class="hidden"></div>
+  <div id="countdown-wrap" class="hidden"></div>
+  <div id="ring-prog" class="hidden"></div>
+  <div id="ring-num" class="hidden"></div>
+  <div id="countdown-msg" class="hidden"></div>
+  <button id="btn-clear-log" class="hidden"></button>
+
+  <script src="config.js"></script>
+  <script src="popup.js"></script>
+</body>
+
+</html>
